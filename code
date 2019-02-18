@@ -26,7 +26,6 @@ LEFT JOIN (SELECT *
            FROM cb_transactions t
            where (t.value_decision is null or t.value_decision != 'Fail')
                 )
-           --where first_utx  = 1
           ) tt ON tt.utx_id = u.utx_id
  
 JOIN (SELECT user_id, suspect target
