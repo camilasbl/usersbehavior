@@ -1,0 +1,75 @@
+SELECT target, prediction, count(utx_id) utx_count, avg(event_counter) avg_brand_views
+FROM
+(
+SELECT event1, u.user_id, u.date1, event, u.brand, u.utx_id, count(event) over(partition by u.user_id order by u.date1 rows between unbounded preceding and current row) event_counter, uu.prediction, payment_method, target, uu.first_utx
+  
+FROM
+((
+SELECT 'screen view' event1, "zeek user id" user_id, "time" date1, case when "event" = 'screen view brand' then 1 else 0 end event, "zeek brand" brand,  "zeek tx id" tx_id, null as utx_id, null as brand_bought
+FROM mixpanel_events e
+WHERE event in ('screen view brand', 'transaction')
+  and ("zeek tx decision" is null or "zeek tx decision" != 'Fail')
+
+UNION 
+
+SELECT 'transaction' event1, t.value_user_id user_id, t.value_date date1, null as event, t.value_brand_id brand, t.value_transaction_id tx_id, t.id utx_id, v.value_brand_id brand_bought 
+FROM cb_transactions t
+JOIN cb_transactions_value_voucher_ids vid ON vid.cb_transactions_id = t.id
+JOIN cb_vouchers v ON vid.value = v.id
+where (t.value_decision is null or t.value_decision != 'Fail')
+) u                                                                                                  -- UNION of mixpanel_events and cb_transactions 
+
+ 
+LEFT JOIN (SELECT * 
+           FROM (
+           SELECT t.value_user_id user_id, t.value_date date1, t.value_transaction_id tx_id, t.id utx_id, row_number() over( partition by user_id order by date1) as first_utx 
+           FROM cb_transactions t
+           where (t.value_decision is null or t.value_decision != 'Fail')
+                )
+           --where first_utx  = 1
+          ) tt ON tt.utx_id = u.utx_id
+ 
+JOIN (SELECT user_id, suspect target
+  FROM table_risk_model_tagging_reason 
+  WHERE is_excluded is null) f ON f.user_id = u.user_id                                              
+LEFT JOIN view_business_buyers bb ON bb.zeek_user_id = u.user_id
+LEFT JOIN(SELECT user_id, utx_id, utx_date, prediction, payment_method, first_utx
+  FROM
+  (
+  SELECT r.user_id, utx_id, utx_date, payment_method, first_utx,
+  case 
+   when sim_probability_1 >= 0.48 then 1 
+   when sim_probability_1 < 0.48 then 0
+  end prediction
+  FROM table_risk_model_results r 
+  JOIN table_risk_model_tagging_reason tr ON tr.user_id = r.user_id
+    JOIN cb_transactions t on t.value_id = r.utx_id
+  where set_name IN ('train')
+  and version = '1.0.20181021125707'
+  --and suspect = 1
+  and t.value_status!= 'processor_declined'
+
+ UNION
+
+  SELECT p.user_id, utx_id, utx_date, payment_method, first_utx,
+  case 
+   when risk_model_probability >= 0.48 then 1
+   when risk_model_probability < 0.48 then 0
+  end prediction
+  FROM table_risk_model_production p 
+  JOIN table_risk_model_tagging_reason tr ON tr.user_id = p.user_id
+  JOIN cb_transactions t on t.value_id = p.utx_id
+  WHERE risk_model_version = '1.0.20181021125707'
+  and t.value_status!= 'processor_declined'
+  ) 
+    WHERE utx_date between '2018-01-01' and current_date
+     ) uu ON uu.utx_id = u.utx_id)
+   
+WHERE u.date1 between '2018-01-01' and current_date
+  AND bb.zeek_user_id is null  
+ORDER BY u.date1 asc
+)
+WHERE event1 = 'transaction'
+  and first_utx = 1
+  and payment_method  IN ('PayPal', 'CreditCard')
+GROUP BY target, prediction
